@@ -9,6 +9,38 @@ template-metadata:
     when ingest returns to pre-spike levels. Due to the sensitivity of this action,
     this workflow only works against a single stream.
   categories: [response, monitoring]
+  install:
+    form:
+      - name: stream
+        label: "Stream name"
+        description: "The name of the stream to monitor"
+        inputType: text
+        required: true
+      - name: component
+        label: "Component name"
+        description: "The name of the component template to use for shard count adjustments"
+        inputType: text
+        required: true
+      - name: time_field
+        label: "Time field name"
+        description: "What time field to use for detection. event.ingested is suggested but @timestamp is an alternative."
+        inputType: text
+        required: true
+      - name: spike_ratio
+        label: "Spike ratio"
+        description: "By what factor must ingest increase to trigger action. 10 is a good starting point."
+        inputType: number
+        required: true
+      - name: revert_ratio
+        label: "Revert ratio"
+        description: "Return sharding to prior levels when ingest falls to this factor of the original baseline rate."
+        inputType: number
+        required: true
+      - name: cooldown_seconds
+        label: "Cooldown seconds"
+        description: "Don't consider reducing shards until baseline has been achieved for at least this many seconds (21600 is suggested)"
+        inputType: number
+        required: true
 
 name: shard-autoscaler
 description: >
@@ -22,13 +54,13 @@ triggers:
       every: 5m
 
 consts:
-  stream: logs-myapp-default
-  component: logs-myapp@custom
-  time_field: event.ingested
-  spike_ratio: 10
-  revert_ratio: 2
+  stream: __install__.stream
+  component: __install__.component
+  time_field: __install__.time_field
+  spike_ratio: __install__.spike_ratio
+  revert_ratio: __install__.revert_ratio
   min_docs: 5000            # ignore tiny streams
-  cooldown_seconds: 21600
+  cooldown_seconds: __install__.cooldown_seconds
 
 steps:
   - name: get_state
