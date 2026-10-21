@@ -1,0 +1,147 @@
+template-metadata:
+  slug: shard-autoscaler
+  version: "1.0.0"
+  availability: ">=9.5.0"                      # semver range over Kibana versions
+  name: "Shard Autoscaler"
+  description: >-
+    For the chosen data stream, when ingest exceeds a factor (10x by default), scale up
+    shards from baseline to number_of_hot_nodes // 2 - 1 and return to baseline
+    when ingest returns to pre-spike levels. Due to the sensitivity of this action,
+    this workflow only works against a single stream.
+  categories: [response, monitoring]
+
+name: shard-autoscaler
+description: >
+  Automated shard scaler, which responds to spikes in ingest by increasing the 
+  number of primaries for an affected stream to num_hot_nodes // num_replicas - 1, 
+  and returning the count back to baseline when ingest rates fall sufficiently.
+enabled: true
+triggers:
+  - type: scheduled
+    with:
+      every: 5m
+
+consts:
+  stream: logs-myapp-default
+  component: logs-myapp@custom
+  time_field: event.ingested
+  spike_ratio: 10
+  revert_ratio: 2
+  min_docs: 5000            # ignore tiny streams
+  cooldown_seconds: 21600
+
+steps:
+  - name: get_state
+    type: elasticsearch.request
+    with:
+      method: GET
+      path: "/_component_template/{{ consts.component }}"
+  - name: idx_settings
+    type: elasticsearch.request
+    with:
+      method: GET
+      path: /{{ consts.stream }}/_settings/index.number_of_replicas
+
+  - name: hot_nodes
+    type: elasticsearch.request
+    with:
+      method: GET
+      path: /_cat/nodes?format=json&h=role
+
+  - name: hot_only
+    type: data.filter
+    items: "${{ steps.hot_nodes.output }}"
+    with:
+      condition: "item.role : *h*"      # 'h' = hot tier role
+
+  - name: volume
+    type: elasticsearch.search
+    with:
+      index: "{{ consts.stream }}"
+      size: 0
+      track_total_hits: false
+      aggregations:
+        recent:
+          filter:
+            range:
+              event.ingested:
+                gte: "now-15m"
+        per_15m:
+          filter:
+            range:
+              event.ingested:
+                gte: "now-7d"
+                lt: "now-15m"
+          aggregations:
+            h:
+              date_histogram: { field: "{{ consts.time_field }}", fixed_interval: "15m" }
+        baseline_p50:
+          percentiles_bucket:
+            buckets_path: "per_15m>h>_count"
+            percents: [50]
+
+  - name: inputs
+    type: data.set
+    with:
+      recent: "${{ steps.volume.output.aggregations.recent.doc_count }}"
+      p50: "${{ steps.volume.output.aggregations.baseline_p50.values['50.0'] | at_least: 1 }}"
+      hot_count: "${{ steps.hot_only.output | size }}"
+      current: "{%- assign cs = steps.get_state.output.component_templates[0].component_template._meta.current_shards -%}{%- if cs -%}{{ cs }}{%- else -%}{{ steps.get_state.output.component_templates[0].component_template.template.settings.index.number_of_shards }}{%- endif -%}"
+      baseline_shards: "{%- assign bs = steps.get_state.output.component_templates[0].component_template._meta.baseline_shards -%}{%- if bs -%}{{ bs }}{%- else -%}{{ steps.get_state.output.component_templates[0].component_template.template.settings.index.number_of_shards }}{%- endif -%}"
+      scaled_at: "{{ steps.get_state.output.component_templates[0].component_template._meta.scaled_at | default: '1970-01-01T00:00:00.000Z' }}"
+      scaled_at_epoch: "${{ steps.get_state.output.component_templates[0].component_template._meta.scaled_at | default: '1970-01-01T00:00:00.000Z' | date: '%s' }}"
+      number_of_replicas: "{%- assign nr = '1' -%}{% for pair in steps.idx_settings.output limit:1 %}{% assign nr = pair[1].settings.index.number_of_replicas %}{% endfor %}{{ nr }}"
+      divisor: "{%- assign nr = '1' -%}{% for pair in steps.idx_settings.output limit:1 %}{% assign nr = pair[1].settings.index.number_of_replicas %}{% endfor %}{{ nr | plus: 1 }}"
+
+  - name: derived
+    type: data.set
+    with:
+      ratio: "${{ steps.inputs.output.recent | divided_by: steps.inputs.output.p50 }}"
+      target: "${{ steps.inputs.output.hot_count | divided_by: steps.inputs.output.divisor | floor | minus: 1 | at_least: 1 }}"
+      age_s: "${{ now | date: '%s' | minus: steps.inputs.output.scaled_at_epoch }}"
+
+  - name: scale_up
+    type: if
+    condition: "steps.derived.output.ratio >= {{ consts.spike_ratio }} and steps.inputs.output.recent >= {{ consts.min_docs }} and steps.derived.output.target > {{ steps.inputs.output.current }}"
+    steps:
+      - name: put_scaled
+        type: elasticsearch.request
+        with:
+          method: PUT
+          path: "/_component_template/{{ consts.component }}"
+          body:
+            template:
+              settings:
+                index.number_of_shards: "{{ steps.derived.output.target }}"
+            _meta:
+              baseline_shards: "${{ steps.inputs.output.baseline_shards }}"
+              current_shards: "${{ steps.derived.output.target }}"
+              scaled_at: "{{ now | date_to_xmlschema }}"
+      - name: rollover_up
+        type: elasticsearch.request
+        with:
+          method: POST
+          path: "/{{ consts.stream }}/_rollover"
+
+  - name: scale_down
+    type: if
+    condition: "steps.derived.output.ratio < {{ consts.revert_ratio }} and steps.derived.output.age_s >= {{ consts.cooldown_seconds }} and steps.inputs.output.current > {{ steps.inputs.output.baseline_shards }}"
+    steps:
+      - name: put_baseline
+        type: elasticsearch.request
+        with:
+          method: PUT
+          path: "/_component_template/{{ consts.component }}"
+          body:
+            template:
+              settings:
+                index.number_of_shards: "{{ steps.inputs.output.baseline_shards }}"
+            _meta:
+              baseline_shards: "${{ steps.inputs.output.baseline_shards }}"
+              current_shards: "${{ steps.inputs.output.baseline_shards }}"
+              scaled_at: "{{ now | date_to_xmlschema }}"
+      - name: rollover_down
+        type: elasticsearch.request
+        with:
+          method: POST
+          path: "/{{ consts.stream }}/_rollover"
